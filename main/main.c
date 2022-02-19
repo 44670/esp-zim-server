@@ -326,8 +326,8 @@ int wifiSwitchToAPMode(const char *ssid, const char *psk, int maxConns,
   strcpy((char *)wifi_config.ap.password, psk);
   wifi_config.ap.ssid_len = strlen(ssid);
 
-  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-  ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config));
+  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+  ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_AP, &wifi_config));
   ESP_ERROR_CHECK(esp_wifi_start());
   return 0;
 }
@@ -398,7 +398,8 @@ void app_main(void) {
     nvs_flash_init();
   }
   wifiEarlyInit();
-  wifiSwitchToSTAMode(WIFI_STA_SSID, WIFI_STA_PSK);
+  wifiSwitchToAPMode(WIFI_AP_SSID, WIFI_AP_PSK, 10,
+                     6);
   start_file_server("/sd/www");
 
   // Card has been initialized, print its properties

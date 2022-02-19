@@ -29,7 +29,7 @@
 #include "sdmmc_cmd.h"
 #include "soc/usb_wrap_struct.h"
 
-static const char *TAG = "example";
+static const char *TAG = "main";
 
 FIL zimFile;
 DWORD zimFileClTbl[128];
@@ -236,8 +236,6 @@ static esp_err_t download_get_handler(httpd_req_t *req) {
   return ESP_OK;
 }
 
-void usbEnablePullup(int enabled);
-
 /* Function to start the file server */
 esp_err_t start_file_server(const char *base_path) {
   static struct file_server_data *server_data = NULL;
@@ -361,9 +359,9 @@ void app_main(void) {
   // To use 1-line SD mode, change this to 1:
   slot_config.width = 1;
 
-  slot_config.cmd = GPIO_NUM_35;
-  slot_config.clk = GPIO_NUM_36;
-  slot_config.d0 = GPIO_NUM_37;
+  slot_config.cmd = PIN_SD_CMD;
+  slot_config.clk = PIN_SD_CLK;
+  slot_config.d0 = PIN_SD_DAT0;
 
   // Enable internal pullups on enabled pins. The internal pullups
   // are insufficient however, please make sure 10k external pullups are

@@ -1,12 +1,4 @@
-/* SD card and FAT filesystem example.
-   This example code is in the Public Domain (or CC0 licensed, at your option.)
 
-   Unless required by applicable law or agreed to in writing, this
-   software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-   CONDITIONS OF ANY KIND, either express or implied.
-*/
-
-// This example uses SDMMC peripheral to communicate with SD card.
 #include <dirent.h>
 #include <stdio.h>
 #include <string.h>
@@ -14,15 +6,28 @@
 #include <sys/stat.h>
 #include <sys/unistd.h>
 
+#include "config.h"
+#include "driver/gpio.h"
+#include "driver/periph_ctrl.h"
 #include "driver/sdmmc_host.h"
 #include "esp_err.h"
+#include "esp_event.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_spiffs.h"
+#include "esp_system.h"
 #include "esp_vfs.h"
 #include "esp_vfs_fat.h"
+#include "esp_wifi.h"
 #include "ff.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "hal/usb_phy_hal.h"
+#include "hal/usb_phy_ll.h"
+#include "nvs_flash.h"
+#include "sdkconfig.h"
 #include "sdmmc_cmd.h"
+#include "soc/usb_wrap_struct.h"
 
 static const char *TAG = "example";
 
@@ -30,27 +35,16 @@ FIL zimFile;
 DWORD zimFileClTbl[128];
 int zimFileReady = 0;
 
-
 /* Max length a file path can have on storage */
 #define FILE_PATH_MAX (ESP_VFS_PATH_MAX + CONFIG_SPIFFS_OBJ_NAME_LEN)
 
-/* Max size of an individual file. Make sure this
- * value is same as that set in upload_script.html */
-#define MAX_FILE_SIZE (200 * 1024)  // 200 KB
-#define MAX_FILE_SIZE_STR "200KB"
 
-/* Scratch buffer size */
-#define SCRATCH_BUFSIZE 8192
+uint8_t tmpBuf[32 * 1024];
 
 struct file_server_data {
   /* Base path of file storage */
   char base_path[ESP_VFS_PATH_MAX + 1];
-
-  /* Scratch buffer for temporary storage during file transfer */
-  char scratch[SCRATCH_BUFSIZE];
 };
-
-static const char *TAG = "file_server";
 
 /* Handler to respond with an icon file embedded in flash.
  * Browsers expect to GET website icon at URI /favicon.ico.
@@ -62,49 +56,58 @@ static esp_err_t favicon_get_handler(httpd_req_t *req) {
   return ESP_OK;
 }
 
-uint8_t zimTmpBuf[32 * 1024];
-static esp_err_t zim_get_handler(httpd_req_t *req) {
-    if (!zimFileReady) {
-        httpd_resp_send_err(req, 500, "ZIM file not ready");
-        return ESP_OK;
-    }
-    const char* uri = req->uri;
-    const char* quest = strchr(uri, '?');
-    const char* comma = strchr(uri, ',');
-    if ((!quest) || (!comma)) {
-        httpd_resp_send_err(req, 500, "No param");
-        return ESP_OK;
-    }
-    // ?123,456 where 123 is offset and 456 is length
-    int64_t offset = _atoi64(quest + 1);
-    int length = atoi(comma + 1);
-    ESP_LOGI("[zim] read offset: %d, length: %d", offset, length);
-    if (offset < 0 || length < 0) {
-        httpd_resp_send_err(req, 500, "Invalid param");
-        return ESP_OK;
-    }
-    if (length > 10 * 1024 * 1024) {
-        httpd_resp_send_err(req, 500, "Too large");
-        return ESP_OK;
-    }
-    httpd_resp_set_type(req, "application/octet-stream");
-    f_lseek(&zimFile, offset);
-    int remainLength = length;
-    while(remainLength > 0) {
-        int readSize = MIN(sizeof(zimTmpBuf), remainLength);
-        UINT bytesRead = 0;
-        f_read(&zimFile, zimTmpBuf, readSize, &bytesRead);
-        if (bytesRead > 0) {
-            httpd_resp_send_chunk(req, (const char*)zimTmpBuf, bytesRead);
-            remainLength -= bytesRead;
-        } else {
-            break;
-        }
-    }
-    httpd_resp_send_chunk(req, NULL, 0);
-
+uint64_t parseUInt64(const char *str) {
+  uint64_t ret = 0;
+  while (*str >= '0' && *str <= '9') {
+    ret *= 10;
+    ret += *str - '0';
+    str++;
+  }
+  return ret;
 }
 
+
+static esp_err_t zim_get_handler(httpd_req_t *req) {
+  if (!zimFileReady) {
+    httpd_resp_send_err(req, 500, "ZIM file not ready");
+    return ESP_OK;
+  }
+  const char *uri = req->uri;
+  const char *quest = strchr(uri, '?');
+  const char *comma = strchr(uri, ',');
+  if ((!quest) || (!comma)) {
+    httpd_resp_send_err(req, 500, "No param");
+    return ESP_OK;
+  }
+  // ?123,456 where 123 is offset and 456 is length
+  int64_t offset = parseUInt64(quest + 1);
+  int length = atoi(comma + 1);
+  ESP_LOGI(TAG, "[zim] read offset: %lld, length: %d", offset, length);
+  if (offset < 0 || length < 0) {
+    httpd_resp_send_err(req, 500, "Invalid param");
+    return ESP_OK;
+  }
+  if (length > 10 * 1024 * 1024) {
+    httpd_resp_send_err(req, 500, "Too large");
+    return ESP_OK;
+  }
+  httpd_resp_set_type(req, "application/octet-stream");
+  f_lseek(&zimFile, offset);
+  int remainLength = length;
+  while (remainLength > 0) {
+    int readSize = MIN(sizeof(tmpBuf), remainLength);
+    UINT bytesRead = 0;
+    f_read(&zimFile, tmpBuf, readSize, &bytesRead);
+    if (bytesRead > 0) {
+      httpd_resp_send_chunk(req, (const char *)tmpBuf, bytesRead);
+      remainLength -= bytesRead;
+    } else {
+      break;
+    }
+  }
+  httpd_resp_send_chunk(req, NULL, 0);
+  return ESP_OK;
+}
 
 #define IS_FILE_EXT(filename, ext) \
   (strcasecmp(&filename[strlen(filename) - sizeof(ext) + 1], ext) == 0)
@@ -116,14 +119,20 @@ static esp_err_t set_content_type_from_file(httpd_req_t *req,
     return httpd_resp_set_type(req, "application/pdf");
   } else if (IS_FILE_EXT(filename, ".html")) {
     return httpd_resp_set_type(req, "text/html");
-  } else if (IS_FILE_EXT(filename, ".jpeg")) {
+  } else if (IS_FILE_EXT(filename, ".jpg")) {
     return httpd_resp_set_type(req, "image/jpeg");
   } else if (IS_FILE_EXT(filename, ".ico")) {
     return httpd_resp_set_type(req, "image/x-icon");
+  } else if (IS_FILE_EXT(filename, ".css")) {
+    return httpd_resp_set_type(req, "text/css");
+  } else if (IS_FILE_EXT(filename, ".js")) {
+    return httpd_resp_set_type(req, "application/javascript");
+  } else if (IS_FILE_EXT(filename, ".wasm")) {
+    return httpd_resp_set_type(req, "application/wasm");
   }
   /* This is a limited set only */
   /* For any other type always set as plain text */
-  return httpd_resp_set_type(req, "text/plain");
+  return httpd_resp_set_type(req, "application/octet-stream");
 }
 
 /* Copies the full path into destination buffer and returns
@@ -180,7 +189,7 @@ static esp_err_t download_get_handler(httpd_req_t *req) {
     return favicon_get_handler(req);
   }
   if (strcmp(filename, "/zim") == 0) {
-      return zim_get_handler(req);
+    return zim_get_handler(req);
   }
   ESP_LOGI(TAG, "Sending file: %s", filename);
   fd = fopen(filepath, "r");
@@ -194,11 +203,11 @@ static esp_err_t download_get_handler(httpd_req_t *req) {
   set_content_type_from_file(req, filename);
 
   /* Retrieve the pointer to scratch buffer for temporary storage */
-  char *chunk = ((struct file_server_data *)req->user_ctx)->scratch;
+  char *chunk = (char*) tmpBuf;
   size_t chunksize;
   do {
     /* Read file in chunks into the scratch buffer */
-    chunksize = fread(chunk, 1, SCRATCH_BUFSIZE, fd);
+    chunksize = fread(chunk, 1, sizeof(tmpBuf), fd);
 
     if (chunksize > 0) {
       /* Send the buffer contents as HTTP response chunk */
@@ -268,33 +277,60 @@ esp_err_t start_file_server(const char *base_path) {
       .user_ctx = server_data  // Pass server data as context
   };
   httpd_register_uri_handler(server, &file_download);
-#if 0
-    /* URI handler for uploading files to server */
-    httpd_uri_t file_upload = {
-        .uri       = "/upload/*",   // Match all URIs of type /upload/path/to/file
-        .method    = HTTP_POST,
-        .handler   = upload_post_handler,
-        .user_ctx  = server_data    // Pass server data as context
-    };
-    httpd_register_uri_handler(server, &file_upload);
-
-    /* URI handler for deleting files from server */
-    httpd_uri_t file_delete = {
-        .uri       = "/delete/*",   // Match all URIs of type /delete/path/to/file
-        .method    = HTTP_POST,
-        .handler   = delete_post_handler,
-        .user_ctx  = server_data    // Pass server data as context
-    };
-    httpd_register_uri_handler(server, &file_delete);
-#endif
-
-
-
-
   return ESP_OK;
 }
 
+int wifiEarlyInit() {
+  ESP_ERROR_CHECK(esp_netif_init());
+  ESP_ERROR_CHECK(esp_event_loop_create_default());
+  esp_netif_create_default_wifi_ap();
+  esp_netif_create_default_wifi_sta();
+  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+  ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+  return 0;
+}
 
+int wifiSwitchToSTAMode(const char *ssid, const char *psk) {
+  wifi_config_t wifi_config = {
+      .sta =
+          {
+              .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+              .pmf_cfg = {.capable = true, .required = false},
+          },
+  };
+  strcpy((char *)wifi_config.sta.ssid, ssid);
+  strcpy((char *)wifi_config.sta.password, psk);
+
+  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+  ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config));
+  ESP_ERROR_CHECK(esp_wifi_start());
+  esp_wifi_connect();
+  return 0;
+}
+
+int wifiSwitchToAPMode(const char *ssid, const char *psk, int maxConns,
+                       int channel) {
+  wifi_config_t wifi_config = {
+      .ap =
+          {
+              .channel = channel,
+              .max_connection = maxConns,
+              .authmode = WIFI_AUTH_WPA_WPA2_PSK,
+              .pmf_cfg =
+                  {
+                      .required = false,
+                  },
+          },
+  };
+  strcpy((char *)wifi_config.ap.ssid, ssid);
+  strcpy((char *)wifi_config.ap.password, psk);
+  wifi_config.ap.ssid_len = strlen(ssid);
+
+  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+  ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config));
+  ESP_ERROR_CHECK(esp_wifi_start());
+  return 0;
+}
 
 void app_main(void) {
   esp_err_t ret;
@@ -309,10 +345,10 @@ void app_main(void) {
   sdmmc_card_t *card;
   ESP_LOGI(TAG, "Initializing SD card");
 
-  // Use settings defined above to initialize SD card and mount FAT filesystem.
-  // Note: esp_vfs_fat_sdmmc/sdspi_mount is all-in-one convenience functions.
-  // Please check its source code and implement error recovery when developing
-  // production applications.
+  // Use settings defined above to initialize SD card and mount FAT
+  // filesystem. Note: esp_vfs_fat_sdmmc/sdspi_mount is all-in-one convenience
+  // functions. Please check its source code and implement error recovery when
+  // developing production applications.
 
   ESP_LOGI(TAG, "Using SDMMC peripheral");
   sdmmc_host_t host = SDMMC_HOST_DEFAULT();
@@ -353,6 +389,17 @@ void app_main(void) {
     return;
   }
   ESP_LOGI(TAG, "Filesystem mounted");
+
+  ret = nvs_flash_init();
+  if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
+      ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    printf("Erasing NVS...\n");
+    ESP_ERROR_CHECK(nvs_flash_erase());
+    nvs_flash_init();
+  }
+  wifiEarlyInit();
+  wifiSwitchToSTAMode(WIFI_STA_SSID, WIFI_STA_PSK);
+  start_file_server("/sd/www");
 
   // Card has been initialized, print its properties
   sdmmc_card_print_info(stdout, card);

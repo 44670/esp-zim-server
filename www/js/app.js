@@ -1272,7 +1272,8 @@ define(['jquery', 'zimArchiveLoader', 'uiUtil', 'settingsStore', 'abstractFilesy
             window.timeoutKeyUpPrefix = window.setTimeout(function () {
                 var prefix = $("#prefix").val();
                 if (prefix && prefix.length > 0 && prefix !== appstate.search.prefix) {
-                    $('#searchArticles').click();
+                    // We don't do that for better performance.
+                    //$('#searchArticles').click();
                 }
             }, 500);
         }

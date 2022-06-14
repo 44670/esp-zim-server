@@ -35,10 +35,6 @@ FIL zimFile;
 DWORD zimFileClTbl[128];
 int zimFileReady = 0;
 
-/* Max length a file path can have on storage */
-#define FILE_PATH_MAX (ESP_VFS_PATH_MAX + CONFIG_SPIFFS_OBJ_NAME_LEN)
-
-
 uint8_t tmpBuf[32 * 1024];
 
 struct file_server_data {
@@ -66,7 +62,6 @@ uint64_t parseUInt64(const char *str) {
   return ret;
 }
 
-
 static esp_err_t zim_get_handler(httpd_req_t *req) {
   if (!zimFileReady) {
     httpd_resp_send_err(req, 500, "ZIM file not ready");
@@ -82,7 +77,7 @@ static esp_err_t zim_get_handler(httpd_req_t *req) {
   // ?123,456 where 123 is offset and 456 is length
   int64_t offset = parseUInt64(quest + 1);
   int length = atoi(comma + 1);
-  ESP_LOGI(TAG, "[zim] read offset: %lld, length: %d", offset, length);
+  // ESP_LOGI(TAG, "[zim] read offset: %lld, length: %d", offset, length);
   if (offset < 0 || length < 0) {
     httpd_resp_send_err(req, 500, "Invalid param");
     return ESP_OK;
@@ -172,8 +167,28 @@ static const char *get_path_from_uri(char *dest, const char *base_path,
 
 /* Handler to download a file kept on the server */
 static esp_err_t download_get_handler(httpd_req_t *req) {
-  char filepath[FILE_PATH_MAX];
+  char filepath[128];
+  char hostBuf[128];
+  memset(filepath, 0, sizeof(filepath));
+  memset(hostBuf, 0, sizeof(hostBuf));
   FILE *fd = NULL;
+
+  // get host in req header
+  if (httpd_req_get_hdr_value_str(req, "Host", hostBuf, sizeof(hostBuf)) ==
+      ESP_OK) {
+    if (strcmp(hostBuf, "192.168.4.1") != 0) {
+      ESP_LOGI(TAG, "Redirect: %s", hostBuf);
+      // redirect to http://192.168.4.1
+      httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/");
+      httpd_resp_set_status(req, "301 Moved Permanently");
+      httpd_resp_send(req, NULL, 0);
+      return ESP_OK;
+    }
+  }
+  // if uri begin with /zim?, call zim_get_handler
+  if (strncmp(req->uri, "/zim?", 5) == 0) {
+    return zim_get_handler(req);
+  }
 
   const char *filename = get_path_from_uri(
       filepath, ((struct file_server_data *)req->user_ctx)->base_path, req->uri,
@@ -188,13 +203,10 @@ static esp_err_t download_get_handler(httpd_req_t *req) {
   if (strcmp(filename, "/favicon.ico") == 0) {
     return favicon_get_handler(req);
   }
-  if (strcmp(filename, "/zim") == 0) {
-    return zim_get_handler(req);
-  }
+
   ESP_LOGI(TAG, "Sending file: %s", filename);
   fd = fopen(filepath, "r");
   if (!fd) {
-    ESP_LOGE(TAG, "Failed to read existing file : %s", filepath);
     /* Respond with 500 Internal Server Error */
     httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
                         "Failed to open file");
@@ -203,7 +215,7 @@ static esp_err_t download_get_handler(httpd_req_t *req) {
   set_content_type_from_file(req, filename);
 
   /* Retrieve the pointer to scratch buffer for temporary storage */
-  char *chunk = (char*) tmpBuf;
+  char *chunk = (char *)tmpBuf;
   size_t chunksize;
   do {
     /* Read file in chunks into the scratch buffer */
@@ -229,9 +241,6 @@ static esp_err_t download_get_handler(httpd_req_t *req) {
   /* Close file after sending complete */
   fclose(fd);
   ESP_LOGI(TAG, "File sending complete");
-
-  /* Respond with an empty chunk to signal HTTP response completion */
-  httpd_resp_set_hdr(req, "Connection", "close");
   httpd_resp_send_chunk(req, NULL, 0);
   return ESP_OK;
 }
@@ -255,7 +264,7 @@ esp_err_t start_file_server(const char *base_path) {
 
   httpd_handle_t server = NULL;
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-
+  config.lru_purge_enable = true; // Kill inactive connections
   /* Use the URI wildcard matching function in order to
    * allow the same handler to respond to multiple different
    * target URIs which match the wildcard scheme */
@@ -285,6 +294,8 @@ int wifiEarlyInit() {
   esp_netif_create_default_wifi_sta();
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
   ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+  // Do not use NVS
+  ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
   return 0;
 }
 
@@ -327,8 +338,11 @@ int wifiSwitchToAPMode(const char *ssid, const char *psk, int maxConns,
   ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
   ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_AP, &wifi_config));
   ESP_ERROR_CHECK(esp_wifi_start());
+  ESP_LOGI(TAG, "Switch to AP mode, ssid: %s, psk: %s", ssid, psk);
   return 0;
 }
+
+int fdnsBeginServer(void);
 
 void app_main(void) {
   esp_err_t ret;
@@ -338,7 +352,7 @@ void app_main(void) {
   // formatted in case when mounting fails.
   esp_vfs_fat_sdmmc_mount_config_t mount_config = {
       .format_if_mount_failed = false,
-      .max_files = 5,
+      .max_files = 15,
   };
   sdmmc_card_t *card;
   ESP_LOGI(TAG, "Initializing SD card");
@@ -396,9 +410,9 @@ void app_main(void) {
     nvs_flash_init();
   }
   wifiEarlyInit();
-  wifiSwitchToAPMode(WIFI_AP_SSID, WIFI_AP_PSK, 10,
-                     6);
+  wifiSwitchToAPMode(WIFI_AP_SSID, WIFI_AP_PSK, 10, 6);
   start_file_server("/sd/www");
+  fdnsBeginServer();
 
   // Card has been initialized, print its properties
   sdmmc_card_print_info(stdout, card);

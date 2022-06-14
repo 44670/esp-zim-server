@@ -2,6 +2,8 @@
 
 An ESP32/ESP32S3-based ZIM server, serve ZIM files from exfat-formatted SD card.
 
+The client side is based on [kiwix-js](https://github.com/kiwix/kiwix-js) project.
+
 # Get Started
 1. Download and install ESP-IDF, the master branch of ESP-IDF is strongly recommended.
 2. You need to patch ESP-IDF to support exfat: 
